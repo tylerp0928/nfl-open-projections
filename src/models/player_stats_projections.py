@@ -5,82 +5,126 @@ import pandas as pd
 import numpy as np
 
 RAW_DIR = Path(os.getenv("RAW_DIR", "data/raw"))
-PROC_DIR = Path(os.getenv("PROC_DIR", "data/processed"))
 ART_DIR = Path(os.getenv("ART_DIR", "data/artifacts"))
+PROC_DIR = Path(os.getenv("PROC_DIR", "data/processed"))
 
-def _safe_div(a,b):
-    return np.where(b>0, a/b, 0.0)
+def _col(df: pd.DataFrame, candidates: list[str], required: bool = True, default: str | None = None) -> str | None:
+    """Return the first existing column (case-insensitive)."""
+    cmap = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in cmap:
+            return cmap[c.lower()]
+    if required and default is None:
+        raise KeyError(f"Missing any of columns: {candidates}")
+    return default
+
+def _safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
+    out = a.astype(float)
+    out = out / b.replace({0: np.nan})
+    return out.fillna(0.0)
 
 def build_player_stat_projections() -> str:
-    usage = pd.read_parquet(PROC_DIR / "player_usage.parquet")
-    weekly_files = [p for p in RAW_DIR.glob("weekly_*.parquet")]
-    weekly = pd.read_parquet(weekly_files[0]) if len(weekly_files)==1 else pd.concat([pd.read_parquet(p) for p in weekly_files], ignore_index=True)
+    # Load weekly data written by ETL
+    weekly_parqs = sorted(RAW_DIR.glob("weekly_*.parquet"))
+    if not weekly_parqs:
+        raise FileNotFoundError("weekly parquet not found in data/raw; run ETL first.")
+    wk = pd.read_parquet(weekly_parqs[-1])
 
-    # Efficiency estimates per player (receiving yds/target, rush yds/carry) from weekly stats
-    rec = weekly[["season","week","player_id","player_name","team","targets","receptions","receiving_yards"]].copy()
-    ru = weekly[["season","week","player_id","player_name","team","rushing_attempts","rushing_yards"]].copy().rename(
-        columns={"rushing_attempts":"carries"})
+    # Map varying column names across nfl_data_py versions
+    season = _col(wk, ["season"])
+    week   = _col(wk, ["week", "game_week"])
+    pid    = _col(wk, ["player_id", "gsis_id", "pfr_id"])
+    pname  = _col(wk, ["player_name", "player", "name"], required=False)
+    team   = _col(wk, ["recent_team", "team", "posteam"])
+    targets = _col(wk, ["targets", "target"], required=False, default=None)
+    recs    = _col(wk, ["receptions", "rec"], required=False, default=None)
+    rec_yds = _col(wk, ["receiving_yards", "rec_yards", "yards_receiving"], required=False, default=None)
+    rec_td  = _col(wk, ["receiving_tds", "rec_tds", "td_receiving"], required=False, default=None)
+    rush_att= _col(wk, ["rushing_attempts", "rush_att", "carries", "rushing_att"], required=False, default=None)
+    rush_yds= _col(wk, ["rushing_yards", "rush_yards", "yards_rushing"], required=False, default=None)
+    rush_td = _col(wk, ["rushing_tds", "rush_tds", "td_rushing"], required=False, default=None)
 
-    # Compute per-player career to date aggregates for shrinkage
-    rec_agg = (rec.groupby(["player_id","player_name","team"], dropna=False)
-               .agg(T=("targets","sum"), Y=("receiving_yards","sum")).reset_index())
-    rec_agg["ypt"] = _safe_div(rec_agg["Y"], rec_agg["T"])
+    # Build a standardized frame
+    df = pd.DataFrame({
+        "season": wk[season].astype(int),
+        "week":   wk[week].astype(int),
+        "player_id": wk[pid],
+        "team":   wk[team],
+    })
+    if pname:
+        df["player_name"] = wk[pname]
+    else:
+        df["player_name"] = "Unknown"
 
-    ru_agg = (ru.groupby(["player_id","player_name","team"], dropna=False)
-              .agg(C=("carries","sum"), RY=("rushing_yards","sum")).reset_index())
-    ru_agg["ypc"] = _safe_div(ru_agg["RY"], ru_agg["C"])
+    # Fill metrics (missing -> 0)
+    for out_col, src in [
+        ("targets", targets), ("receptions", recs), ("rec_yards", rec_yds), ("rec_td", rec_td),
+        ("rush_att", rush_att), ("rush_yards", rush_yds), ("rush_td", rush_td),
+    ]:
+        df[out_col] = wk[src].fillna(0).astype(float) if (src and src in wk.columns) else 0.0
 
-    # League priors by position are not available here, so use global priors
-    # Typical NFL averages ~ 7.5 ypt, ~ 4.3 ypc. We'll compute from data as safer priors.
-    rec_prior = rec_agg.loc[rec_agg["T"]>0, "ypt"].mean() if (rec_agg["T"]>0).any() else 7.5
-    ru_prior = ru_agg.loc[ru_agg["C"]>0, "ypc"].mean() if (ru_agg["C"]>0).any() else 4.3
+    # Team totals per game (for shares/normalization)
+    team_tot = (df.groupby(["season","week","team"], as_index=False)
+                  .agg(team_targets=("targets","sum"),
+                       team_carries=("rush_att","sum")))
+    df = df.merge(team_tot, on=["season","week","team"], how="left")
+    df["team_targets"] = df["team_targets"].fillna(0.0)
+    df["team_carries"] = df["team_carries"].fillna(0.0)
 
-    # Empirical-Bayes shrinkage: posterior = (n/(n+tau))*player + (tau/(n+tau))*prior
-    tau_rec, tau_ru = 50.0, 80.0
-    rec_agg["ypt_shrunk"] = (rec_agg["T"]/(rec_agg["T"]+tau_rec))*rec_agg["ypt"] + (tau_rec/(rec_agg["T"]+tau_rec))*rec_prior
-    ru_agg["ypc_shrunk"] = (ru_agg["C"]/(ru_agg["C"]+tau_ru))*ru_agg["ypc"] + (tau_ru/(ru_agg["C"]+tau_ru))*ru_prior
+    # Per-game usage shares
+    df["target_share"] = _safe_div(df["targets"], df["team_targets"])
+    df["carry_share"]  = _safe_div(df["rush_att"], df["team_carries"])
 
-    # Team volume baselines: average team pass attempts & rush attempts over recent 4 weeks
-    team_week = weekly.groupby(["season","week","team"], dropna=False).agg(
-        team_pass_att=("attempts","sum") if "attempts" in weekly.columns else ("passing_attempts","sum"),
-        team_rush_att=("rushing_attempts","sum")
-    ).reset_index()
+    # Rolling form (last-3) with a prior from player-season mean
+    df = df.sort_values(["player_id","season","week"])
+    def _proj(g: pd.DataFrame) -> pd.DataFrame:
+        ts_mean = g["target_share"].expanding().mean()
+        cs_mean = g["carry_share"].expanding().mean()
+        ts = g["target_share"].rolling(3, min_periods=1).mean().shift(1).fillna(ts_mean)
+        cs = g["carry_share"].rolling(3, min_periods=1).mean().shift(1).fillna(cs_mean)
+        # Convert shares to counting stats using latest team totals observed
+        team_tgt_next = g["team_targets"].rolling(3, min_periods=1).mean().shift(1).fillna(g["team_targets"].expanding().mean())
+        team_car_next = g["team_carries"].rolling(3, min_periods=1).mean().shift(1).fillna(g["team_carries"].expanding().mean())
+        proj_targets = (ts * team_tgt_next).clip(lower=0)
+        proj_carries = (cs * team_car_next).clip(lower=0)
+        # Yardage/TD simple rates
+        ypt = (g["rec_yards"] / g["targets"].replace({0:np.nan})).fillna(7.5)   # yards per target prior
+        ypc = (g["rush_yards"]/ g["rush_att"].replace({0:np.nan})).fillna(4.2)  # yards per carry prior
+        tpr = (g["rec_td"]   / g["targets"].replace({0:np.nan})).fillna(0.04)   # TD per target prior
+        ctd = (g["rush_td"]  / g["rush_att"].replace({0:np.nan})).fillna(0.03)  # TD per carry prior
+        # EWMA smoothing
+        ypt_s = ypt.ewm(alpha=0.5, adjust=False).mean().shift(1).fillna(ypt.mean())
+        ypc_s = ypc.ewm(alpha=0.5, adjust=False).mean().shift(1).fillna(ypc.mean())
+        tpr_s = tpr.ewm(alpha=0.5, adjust=False).mean().shift(1).fillna(tpr.mean())
+        ctd_s = ctd.ewm(alpha=0.5, adjust=False).mean().shift(1).fillna(ctd.mean())
 
-    team_week = team_week.sort_values(["team","season","week"])
-    team_week["pass_att_roll4"] = team_week.groupby("team")["team_pass_att"].transform(lambda s: s.shift(1).rolling(4, min_periods=1).mean())
-    team_week["rush_att_roll4"] = team_week.groupby("team")["team_rush_att"].transform(lambda s: s.shift(1).rolling(4, min_periods=1).mean())
+        out = pd.DataFrame({
+            "proj_targets": proj_targets,
+            "proj_carries": proj_carries,
+            "proj_rec_yards": proj_targets * ypt_s,
+            "proj_rush_yards": proj_carries * ypc_s,
+            "proj_rec_td": proj_targets * tpr_s,
+            "proj_rush_td": proj_carries * ctd_s,
+        })
+        return out
 
-    # Most recent for each team-season
-    team_latest = team_week.groupby(["team","season"]).tail(1)[["team","season","pass_att_roll4","rush_att_roll4"]]
+    proj = df.groupby(["player_id","season"], group_keys=False).apply(_proj).reset_index(drop=True)
+    out = pd.concat([df.reset_index(drop=True), proj], axis=1)
 
-    # Most recent usage for each player-season
-    usage_latest = (usage.sort_values(["player_id","season","week"])
-                        .groupby(["player_id","season"]).tail(1)[
-                            ["player_id","player_name","posteam","season","carry_share_fcast","target_share_fcast"]
-                        ].rename(columns={"posteam":"team"}))
-
-    # Join efficiency priors
-    usage_latest = usage_latest.merge(rec_agg[["player_id","ypt_shrunk"]], on="player_id", how="left")
-    usage_latest = usage_latest.merge(ru_agg[["player_id","ypc_shrunk"]], on="player_id", how="left")
-
-    # Join team volumes
-    usage_latest = usage_latest.merge(team_latest, on=["team","season"], how="left")
-
-    # Project next-game counting stats
-    usage_latest["proj_targets"] = usage_latest["target_share_fcast"] * usage_latest["pass_att_roll4"].fillna(30)
-    usage_latest["proj_rec_yards"] = usage_latest["proj_targets"] * usage_latest["ypt_shrunk"].fillna(rec_prior)
-
-    usage_latest["proj_carries"] = usage_latest["carry_share_fcast"] * usage_latest["rush_att_roll4"].fillna(25)
-    usage_latest["proj_rush_yards"] = usage_latest["proj_carries"] * usage_latest["ypc_shrunk"].fillna(ru_prior)
-
-    # Crude TD models: proportional to usage with scaling
-    usage_latest["proj_rec_td"] = 0.06 * usage_latest["proj_targets"]  # ~6% TD/target baseline
-    usage_latest["proj_rush_td"] = 0.035 * usage_latest["proj_carries"] # ~3.5% TD/carry baseline
+    # Latest row per player-season is our current projection snapshot
+    latest = out.sort_values(["player_id","season","week"]).groupby(["player_id","season"]).tail(1)
 
     ART_DIR.mkdir(parents=True, exist_ok=True)
-    out = usage_latest[["player_id","player_name","team","season",
-                        "proj_targets","proj_rec_yards","proj_rec_td",
-                        "proj_carries","proj_rush_yards","proj_rush_td"]]
-    path = ART_DIR / "player_stat_projections.csv"
-    out.to_csv(path, index=False)
-    return str(path)
+    PROC_DIR.mkdir(parents=True, exist_ok=True)
+    latest_cols = [
+        "player_id","player_name","team","season",
+        "proj_targets","proj_rec_yards","proj_rec_td",
+        "proj_carries","proj_rush_yards","proj_rush_td",
+        "target_share","carry_share"
+    ]
+    latest[latest_cols].to_csv(ART_DIR / "player_stat_projections.csv", index=False)
+
+    # Keep full per-game frame too (optional for analysis)
+    out.to_parquet(PROC_DIR / "player_stat_projections_pergame.parquet", index=False)
+
+    return str(ART_DIR / "player_stat_projections.csv")
