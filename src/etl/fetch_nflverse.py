@@ -6,84 +6,104 @@ import pandas as pd
 RAW_DIR = Path(os.getenv("RAW_DIR", "data/raw"))
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-def _safe_import(fn, years, name):
-    """Call an nfl_data_py import function and tolerate per-year 404s."""
-    import nfl_data_py as nfl
-    frames = []
+def _safe_import(callable_fn, years, name: str) -> pd.DataFrame:
+    """
+    Run an nfl_data_py import function one season at a time.
+    Swallow 404/Not Found for any season and keep going.
+    Never raise — always return a DataFrame (possibly empty).
+    """
+    import nfl_data_py as nfl  # noqa: F401  (ensures package is present)
+    parts = []
     for y in years:
         try:
-            df = fn([y])
+            df = callable_fn([y])
             if df is None or len(df) == 0:
+                print(f"[{name}] {y} empty; skipping.")
                 continue
-            df["season"] = y if "season" not in df.columns else df["season"]
-            frames.append(df)
+            # tiny memory saver: downcast floats if present
+            for c in df.select_dtypes(include="float").columns:
+                df[c] = pd.to_numeric(df[c], downcast="float")
             print(f"[{name}] {y} done.")
+            parts.append(df)
         except Exception as e:
-            msg = str(e).lower()
+            msg = (str(e) or "").lower()
             if "404" in msg or "not found" in msg:
-                print(f"[{name}] {y} not available yet; skipping.")
+                print(f"[{name}] {y} not available; skipping.")
                 continue
-            raise
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            # non-404 error: log and keep going instead of aborting
+            print(f"[{name}] {y} failed with: {e!r} — skipping.")
+            continue
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
+    return out
 
-def _detect_max_season():
-    """Use schedules to infer the latest available season, falling back gracefully."""
-    try:
-        import nfl_data_py as nfl
-        sched = nfl.import_schedules([1999, 2024])  # cheap call to load metadata
-        max_year = int(pd.to_datetime(sched.get("gameday")).dt.year.max())
-        return max(1999, min(max_year, pd.Timestamp("today").year))
-    except Exception:
-        # Fall back to current year - 1
-        return pd.Timestamp("today").year - 1
+def _resolve_years(user_years) -> list[int]:
+    # If user supplied a range/list, clamp to <= current year
+    if user_years is None:
+        smin, smax = 2019, pd.Timestamp.today().year - 0  # allow current year if available
+    else:
+        smin, smax = min(user_years), max(user_years)
+    # don’t exceed current year
+    smax = min(smax, pd.Timestamp.today().year)
+    return list(range(smin, smax + 1))
 
-def run(seasons_range: list[int] | range | None) -> dict:
+def run(seasons) -> dict:
+    """
+    Downloads core nflverse tables into data/raw/*.parquet.
+    Returns dict of file paths. Never raises — downstream can proceed.
+    """
     import nfl_data_py as nfl
 
-    # Normalize input (e.g., [2019..2025]) → clamp to available max
-    if seasons_range is None:
-        seasons_range = range(2019, _detect_max_season() + 1)
-    else:
-        smin, smax = min(seasons_range), max(seasons_range)
-        smax = min(smax, _detect_max_season())
-        seasons_range = range(smin, smax + 1)
-
-    years = list(seasons_range)
+    years = _resolve_years(seasons)
     print(f"[ETL] Seasons resolved to: {years}")
+    out: dict[str, str] = {}
 
-    out = {}
+    try:
+        pbp = _safe_import(nfl.import_pbp_data, years, "pbp")
+        if not pbp.empty:
+            p = RAW_DIR / f"pbp_{years[0]}_{years[-1]}.parquet"
+            pbp.to_parquet(p, index=False)
+            out["pbp"] = str(p)
+    except Exception as e:
+        print("[pbp] save failed:", e)
 
-    # Play-by-play
-    pbp = _safe_import(nfl.import_pbp_data, years, "pbp")
-    if not pbp.empty:
-        p = RAW_DIR / f"pbp_{years[0]}_{years[-1]}.parquet"
-        pbp.to_parquet(p, index=False); out["pbp"] = str(p)
+    try:
+        wk = _safe_import(nfl.import_weekly_data, years, "weekly")
+        if not wk.empty:
+            p = RAW_DIR / f"weekly_{years[0]}_{years[-1]}.parquet"
+            wk.to_parquet(p, index=False)
+            out["weekly"] = str(p)
+    except Exception as e:
+        print("[weekly] save failed:", e)
 
-    # Weekly
-    wk = _safe_import(nfl.import_weekly_data, years, "weekly")
-    if not wk.empty:
-        p = RAW_DIR / f"weekly_{years[0]}_{years[-1]}.parquet"
-        wk.to_parquet(p, index=False); out["weekly"] = str(p)
+    try:
+        rosters = _safe_import(nfl.import_rosters, years, "rosters")
+        if not rosters.empty:
+            p = RAW_DIR / f"rosters_{years[0]}_{years[-1]}.parquet"
+            rosters.to_parquet(p, index=False)
+            out["rosters"] = str(p)
+    except Exception as e:
+        print("[rosters] save failed:", e)
 
-    # Rosters
-    ros = _safe_import(nfl.import_rosters, years, "rosters")
-    if not ros.empty:
-        p = RAW_DIR / f"rosters_{years[0]}_{years[-1]}.parquet"
-        ros.to_parquet(p, index=False); out["rosters"] = str(p)
+    try:
+        schedules = _safe_import(nfl.import_schedules, years, "schedules")
+        if not schedules.empty:
+            p = RAW_DIR / f"schedules_{years[0]}_{years[-1]}.parquet"
+            schedules.to_parquet(p, index=False)
+            out["schedules"] = str(p)
+    except Exception as e:
+        print("[schedules] save failed:", e)
 
-    # Schedules
-    sch = _safe_import(nfl.import_schedules, years, "schedules")
-    if not sch.empty:
-        p = RAW_DIR / f"schedules_{years[0]}_{years[-1]}.parquet"
-        sch.to_parquet(p, index=False); out["schedules"] = str(p)
-
-    # ID map (cross-walk)
+    # ID map is optional
     try:
         ids = nfl.import_ids()
         if ids is not None and len(ids) > 0:
             p = RAW_DIR / "ids_latest.parquet"
-            ids.to_parquet(p, index=False); out["ids"] = str(p)
+            ids.to_parquet(p, index=False)
+            out["ids"] = str(p)
     except Exception as e:
-        print("IDs import failed (non-fatal):", e)
+        print("[ids] import failed (non-fatal):", e)
 
+    print("[ETL] wrote:", out)
     return out
