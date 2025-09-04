@@ -36,7 +36,16 @@ def train_and_save_extended():
     p = model.predict_proba(X)[:,1]
     metrics = {"brier": float(brier_score_loss(y, p)), "logloss": float(log_loss(y, p))}
 
+        # --- save model + metrics ---
     ART_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"model":model,"features":feature_cols}, ART_DIR / "game_win_extended.joblib")
-    pd.Series(metrics).to_json(ART_DIR / "game_win_extended_metrics.json")
+
+    # Save both the trained model and the feature list
+    joblib.dump(model, ART_DIR / "game_win_extended.joblib")
+    pd.Series(feature_cols).to_json(ART_DIR / "game_win_extended_features.json")
+
+    # Save metrics
+    import json
+    with open(ART_DIR / "game_win_extended_metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+
     return metrics
