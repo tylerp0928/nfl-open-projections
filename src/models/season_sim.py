@@ -28,6 +28,35 @@ def _load_game_model_table() -> pd.DataFrame:
     if not p.exists():
         raise FileNotFoundError("game_model_table.parquet not found; run enrich step first.")
     df = pd.read_parquet(p)
+
+    # --- ensure we have home_win_prob ---
+    if "home_win_prob" not in df.columns:
+        # Try to score with the trained model if present
+        try:
+            import joblib
+            model_path = ART_DIR / "game_win_extended.joblib"
+            if model_path.exists():
+                clf = joblib.load(model_path)
+                # minimal feature set used in training (adjust if you customized)
+                feat_cols = [c for c in df.columns if c.startswith(("off_", "def_", "net_", "rest_", "travel_", "is_dome", "is_altitude", "is_neutral"))]
+                X = df[feat_cols].fillna(0.0)
+                proba = clf.predict_proba(X)[:, 1]  # P(home win)
+                df["home_win_prob"] = proba.clip(0.001, 0.999)
+            else:
+                # Fallback proxy from net_diff if model not found
+                import numpy as np
+                def sigmoid(x): return 1/(1+np.exp(-x))
+                k = 0.9  # slope guess
+                base = df.get("net_diff", pd.Series(0, index=df.index)).fillna(0)
+                hfa  = 0.25  # modest home field bump already baked into features usually
+                df["home_win_prob"] = sigmoid(k * base + hfa).clip(0.001, 0.999)
+        except Exception as e:
+            # Last-ditch fallback: purely from net_diff
+            import numpy as np
+            def sigmoid(x): return 1/(1+np.exp(-x))
+            base = df.get("net_diff", pd.Series(0, index=df.index)).fillna(0)
+            df["home_win_prob"] = sigmoid(0.9 * base + 0.25).clip(0.001, 0.999)
+
     # Normalize team codes
     for col in ["home_team", "away_team"]:
         if col in df.columns:
