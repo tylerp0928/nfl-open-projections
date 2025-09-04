@@ -16,3 +16,4 @@ python-dotenv>=1.0
 streamlit>=1.36
 plotly>=5.22
 requests>=2.32
+matplotlib>=3.9
