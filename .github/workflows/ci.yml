@@ -1,0 +1,68 @@
+name: nfl-open-projections
+
+on:
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: "Seasons range (e.g., 2019-2025)"
+        required: true
+        default: "2019-2025"
+  schedule:
+    - cron: "0 13 * * *"   # daily 13:00 UTC (~9am ET)
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+    env:
+      PUSH_DATA: 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run extended pipeline
+        run: |
+          python -m src.pipelines.run_extended --seasons "${{ github.event.inputs.seasons || '2019-2025' }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts
+          path: |
+            data/artifacts/**
+            data/processed/context_features.parquet
+            data/processed/team_ratings.parquet
+            data/processed/game_model_table.parquet
+
+      # Commit data back to main so Streamlit always sees fresh files
+      - name: Commit data folders back to main
+        if: env.PUSH_DATA == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ARTIFACTS_PAT }}
+          GIT_AUTHOR_NAME: "nfl-bot"
+          GIT_AUTHOR_EMAIL: "bot@example.com"
+          GIT_COMMITTER_NAME: "nfl-bot"
+          GIT_COMMITTER_EMAIL: "bot@example.com"
+        run: |
+          set -e
+          mkdir -p data/artifacts data/processed
+          git add -f data/artifacts data/processed
+          git commit -m "Update data ($(date -u +'%Y-%m-%dT%H:%M:%SZ'))" || true
+          git push -u https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }}
